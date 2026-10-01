@@ -9436,6 +9436,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
+    // small kv step keeps the F32 V tile in L1
+    static constexpr int KV_STEP = 16;
+    static_assert(KV_STEP <= KV_TILE_SZ, "KV_STEP must fit in the KQ scratch");
+
     const size_t q_row_size = ggml_row_size(k_vec_dot_type, DK);
 
     // per-thread scratch: Q_q [Q_TILE_SZ][DK], KQ [Q_TILE_SZ][KV_TILE_SZ], VKQ32 [Q_TILE_SZ][DV], V32 [KV_TILE_SZ][DV]
@@ -9483,8 +9487,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
 
         memset(VKQ32, 0, nr*DV*sizeof(float));
 
-        for (int64_t ic = ic_start; ic < ic_end; ic += KV_TILE_SZ) {
-            const int nkv = (int) std::min((int64_t) KV_TILE_SZ, ic_end - ic);
+        for (int64_t ic = ic_start; ic < ic_end; ic += KV_STEP) {
+            const int nkv = (int) std::min((int64_t) KV_STEP, ic_end - ic);
 
             // KQ [nr][nkv]
             bool all_masked = true;
@@ -9715,8 +9719,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
+    // number of q rows that read the same K and V rows (GQA heads x tokens)
+    const int64_t n_rows_per_kv = neq1*std::min(neq2/nek2, neq2/nev2);
+    const bool use_grouped = !use_ref && q->type == GGML_TYPE_F32 && n_rows_per_kv > 1;
+
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && (use_grouped || (kv_is_f32_or_f16 && k->type == v->type)) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9731,10 +9739,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        if (ic_start < nek1) {
+        if (ic_start < nek1 && use_grouped) {
             ggml_compute_forward_flash_attn_ext_f16_grouped(
                 params, dst, 0, neq2, ic_start, ic_end,
                 chunk_partials, partial_stride);
+        } else if (ic_start < nek1) {
+            for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                    params, dst, q_head, q_head + 1, ic_start, ic_end,
+                    chunk_partials, partial_stride);
+            }
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 float * q_partials = chunk_partials + q_head * partial_stride;
@@ -9792,10 +9806,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
-            } else if (use_ref) {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
-            } else {
+            } else if (use_grouped) {
                 ggml_compute_forward_flash_attn_ext_f16_grouped(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+            } else {
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);

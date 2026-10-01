@@ -9494,31 +9494,44 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
 
         memset(VKQ32, 0, nr*DV*sizeof(float));
 
-        for (int64_t ic = ic_start; ic < ic_end; ic += KV_STEP) {
-            const int nkv = (int) std::min((int64_t) KV_STEP, ic_end - ic);
-
-            // KQ [nr][nkv], start with the mask
-            bool all_masked = true;
-            for (int t = 0; t < nr; ++t) {
-                for (int j = 0; j < nkv; ++j) {
-                    const float mv = mp[t] ? slope[t]*GGML_CPU_FP16_TO_FP32(mp[t][ic + j]) : 0.0f;
-                    all_masked = all_masked && mv == -INFINITY;
-                    KQ[t*nkv + j] = mv;
+        int64_t ic = ic_start;
+        while (ic < ic_end) {
+            // KQ [nr][KV_STEP], start with the mask
+            // gather the next KV_STEP positions that are not masked for all rows
+            int64_t pos[KV_STEP];
+            int nkv = 0;
+            for (; ic < ic_end && nkv < KV_STEP; ++ic) {
+                bool active = false;
+                for (int t = 0; t < nr; ++t) {
+                    const float mv = mp[t] ? slope[t]*GGML_CPU_FP16_TO_FP32(mp[t][ic]) : 0.0f;
+                    active = active || mv != -INFINITY;
+                    KQ[t*KV_STEP + nkv] = mv;
+                }
+                if (active) {
+                    pos[nkv++] = ic;
                 }
             }
 
-            if (all_masked) {
-                continue;
+            if (nkv == 0) {
+                break;
+            }
+
+            // pad a short last tile: zero weight and zero V
+            for (int j = nkv; j < KV_STEP; ++j) {
+                for (int t = 0; t < nr; ++t) {
+                    KQ[t*KV_STEP + j] = -INFINITY;
+                }
+                memset(V32 + j*DV, 0, DV*sizeof(float));
             }
 
             for (int j = 0; j < nkv; ++j) {
-                const char * k_data = (const char *) k->data + ((ic + j)*nbk1 + ik2*nbk2 + ik3*nbk3);
+                const char * k_data = (const char *) k->data + (pos[j]*nbk1 + ik2*nbk2 + ik3*nbk3);
                 if (k_f16) {
                     ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, K32, DK);
                 }
 
                 for (int t = 0; t < nr; ++t) {
-                    if (KQ[t*nkv + j] == -INFINITY) {
+                    if (KQ[t*KV_STEP + j] == -INFINITY) {
                         continue;
                     }
 
@@ -9533,19 +9546,19 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
                     if (logit_softcap != 0.0f) {
                         s = logit_softcap*tanhf(s);
                     }
-                    KQ[t*nkv + j] += s;
+                    KQ[t*KV_STEP + j] += s;
                 }
             }
 
             // online softmax, KQ becomes expf(KQ - M)
             for (int t = 0; t < nr; ++t) {
-                float * kq = KQ + t*nkv;
+                float * kq = KQ + t*KV_STEP;
 
                 float tile_max;
-                ggml_vec_max_f32(nkv, &tile_max, kq);
+                ggml_vec_max_f32(KV_STEP, &tile_max, kq);
 
                 if (tile_max == -INFINITY) {
-                    memset(kq, 0, nkv*sizeof(float));
+                    memset(kq, 0, KV_STEP*sizeof(float));
                     continue;
                 }
 
@@ -9556,12 +9569,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
                     M[t]  = tile_max;
                 }
 
-                S[t] += ggml_vec_soft_max_f32(nkv, kq, kq, M[t]);
+                S[t] += ggml_vec_soft_max_f32(KV_STEP, kq, kq, M[t]);
             }
 
             // VKQ += KQ*V
             for (int j = 0; j < nkv; ++j) {
-                const char * v_data = (const char *) v->data + ((ic + j)*nbv1 + iv2*nbv2 + iv3*nbv3);
+                const char * v_data = (const char *) v->data + (pos[j]*nbv1 + iv2*nbv2 + iv3*nbv3);
                 if (v->type == GGML_TYPE_F32) {
                     memcpy(V32 + j*DV, v_data, DV*sizeof(float));
                 } else if (v->type == GGML_TYPE_F16) {
@@ -9571,7 +9584,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
                 }
             }
 
-            simd_gemm(VKQ32, KQ, V32, nr, nkv, DV);
+            simd_gemm(VKQ32, KQ, V32, nr, KV_STEP, DV);
         }
 
         for (int t = 0; t < nr; ++t) {

@@ -9242,7 +9242,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
-                int n_inf = 0;
+                bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     float * m32 = mask32 + tq * KV_TILE_SZ;
@@ -9250,8 +9250,13 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     if (slope != 1.0f) {
                         ggml_vec_scale_f32(kv_tile, m32, slope);
                     }
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        n_inf += m32[tk] == -INFINITY;
+                    // stop checking after the first row with a finite value
+                    if (can_skip) {
+                        int n_inf = 0;
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            n_inf += m32[tk] == -INFINITY;
+                        }
+                        can_skip = n_inf == kv_tile;
                     }
                     // Pad remaining mask entries with -inf
                     for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
@@ -9259,7 +9264,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                     }
                 }
 
-                if (n_inf == tile_rows * kv_tile) {
+                if (can_skip) {
                     continue;
                 }
             }

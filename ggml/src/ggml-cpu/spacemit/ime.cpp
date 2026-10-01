@@ -955,9 +955,9 @@ class tensor_traits_common : public tensor_traits_base {
                                      n_tasks;
 
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                    // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                    // Per-thread tiled scratch + partial M, S and VKQ accumulator (DV) per q head and kv chunk
                     size_t n_chunks = n_tasks;
-                    size_t decode   = sizeof(float) * (neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV));
+                    size_t decode   = prefill + sizeof(float) * neq2 * n_chunks * (2 + DV);
 
                     size = MAX(prefill, decode);
                 }

@@ -9440,14 +9440,17 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
     static constexpr int KV_STEP = 16;
     static_assert(KV_STEP <= KV_TILE_SZ, "KV_STEP must fit in the KQ scratch");
 
-    const size_t q_row_size = ggml_row_size(k_vec_dot_type, DK);
+    // F16 K: convert each K row to F32 once and share it across the q rows
+    const bool k_f16 = k->type == GGML_TYPE_F16;
+    const size_t q_row_size = k_f16 ? DK*sizeof(float) : ggml_row_size(k_vec_dot_type, DK);
 
-    // per-thread scratch: Q_q [Q_TILE_SZ][DK], KQ [Q_TILE_SZ][KV_TILE_SZ], VKQ32 [Q_TILE_SZ][DV], V32 [KV_TILE_SZ][DV]
+    // per-thread scratch (same block as the tiled kernel): Q_q [Q_TILE_SZ][DK], KQ [Q_TILE_SZ][KV_TILE_SZ] (+ unused mask slot), VKQ32 [Q_TILE_SZ][DV], V32 [KV_TILE_SZ][DV], K32 [DK]
     float * base  = (float *) params->wdata + params->ith*ggml_fa_wsize_per_thread(DK, DV);
     char  * Q_q   = (char *) base;
     float * KQ    = base  + Q_TILE_SZ*DK;
-    float * VKQ32 = KQ    + Q_TILE_SZ*KV_TILE_SZ;
+    float * VKQ32 = KQ    + 2*Q_TILE_SZ*KV_TILE_SZ;
     float * V32   = VKQ32 + Q_TILE_SZ*DV;
+    float * K32   = V32   + KV_TILE_SZ*DV;
 
     float M[Q_TILE_SZ];
     float S[Q_TILE_SZ];
@@ -9475,7 +9478,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
             const int64_t i2 = iq2 + (iq1 + t) / neq1;
 
             const float * pq = (const float *) ((const char *) q->data + (i1*nbq1 + i2*nbq2 + iq3*nbq3));
-            q_to_vec_dot(pq, Q_q + t*q_row_size, DK);
+            if (k_f16) {
+                memcpy(Q_q + t*q_row_size, pq, q_row_size);
+            } else {
+                q_to_vec_dot(pq, Q_q + t*q_row_size, DK);
+            }
 
             const uint32_t h = i2; // head index
             slope[t] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
@@ -9490,32 +9497,44 @@ static void ggml_compute_forward_flash_attn_ext_f16_grouped(
         for (int64_t ic = ic_start; ic < ic_end; ic += KV_STEP) {
             const int nkv = (int) std::min((int64_t) KV_STEP, ic_end - ic);
 
-            // KQ [nr][nkv]
+            // KQ [nr][nkv], start with the mask
             bool all_masked = true;
-            for (int j = 0; j < nkv; ++j) {
-                const char * k_data = (const char *) k->data + ((ic + j)*nbk1 + ik2*nbk2 + ik3*nbk3);
-
-                for (int t = 0; t < nr; ++t) {
+            for (int t = 0; t < nr; ++t) {
+                for (int j = 0; j < nkv; ++j) {
                     const float mv = mp[t] ? slope[t]*GGML_CPU_FP16_TO_FP32(mp[t][ic + j]) : 0.0f;
-
-                    float s = -INFINITY;
-                    if (mv != -INFINITY) {
-                        kq_vec_dot(DK, &s, 0, k_data, 0, Q_q + t*q_row_size, 0, 1);
-
-                        s = s*scale;
-                        if (logit_softcap != 0.0f) {
-                            s = logit_softcap*tanhf(s);
-                        }
-                        s += mv;
-
-                        all_masked = false;
-                    }
-                    KQ[t*nkv + j] = s;
+                    all_masked = all_masked && mv == -INFINITY;
+                    KQ[t*nkv + j] = mv;
                 }
             }
 
             if (all_masked) {
                 continue;
+            }
+
+            for (int j = 0; j < nkv; ++j) {
+                const char * k_data = (const char *) k->data + ((ic + j)*nbk1 + ik2*nbk2 + ik3*nbk3);
+                if (k_f16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, K32, DK);
+                }
+
+                for (int t = 0; t < nr; ++t) {
+                    if (KQ[t*nkv + j] == -INFINITY) {
+                        continue;
+                    }
+
+                    float s;
+                    if (k_f16) {
+                        ggml_vec_dot_f32(DK, &s, 0, K32, 0, (const float *) (Q_q + t*q_row_size), 0, 1);
+                    } else {
+                        kq_vec_dot(DK, &s, 0, k_data, 0, Q_q + t*q_row_size, 0, 1);
+                    }
+
+                    s = s*scale;
+                    if (logit_softcap != 0.0f) {
+                        s = logit_softcap*tanhf(s);
+                    }
+                    KQ[t*nkv + j] += s;
+                }
             }
 
             // online softmax, KQ becomes expf(KQ - M)

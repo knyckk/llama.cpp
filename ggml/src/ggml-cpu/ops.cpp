@@ -9234,40 +9234,53 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
-                bool can_skip = true;
+                int n_inf = 0;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    float * m32 = mask32 + tq * KV_TILE_SZ;
+                    ggml_cpu_fp16_to_fp32(mp_row + ic, m32, kv_tile);
+                    if (slope != 1.0f) {
+                        ggml_vec_scale_f32(kv_tile, m32, slope);
+                    }
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
-                        }
+                        n_inf += m32[tk] == -INFINITY;
                     }
                     // Pad remaining mask entries with -inf
                     for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
+                        m32[tk] = -INFINITY;
                     }
                 }
 
-                if (can_skip) {
+                if (n_inf == tile_rows * kv_tile) {
                     continue;
                 }
             }
 
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
-            for (int tk = 0; tk < kv_tile; tk++) {
+            // convert TB rows to F32 in KQ (unused until the GEMM below), then write TB contiguous floats per dk
+            const int TB = (int) std::min<int64_t>(8, (Q_TILE_SZ * KV_TILE_SZ) / DK);
+            for (int tk0 = 0; tk0 < kv_tile && TB > 0; tk0 += TB) {
+                const int nt = std::min(TB, kv_tile - tk0);
+                for (int t = 0; t < nt; t++) {
+                    const char * k_data = (const char *)k->data + (ic + tk0 + t)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                    if (kv_type == GGML_TYPE_F16) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)k_data, KQ + t*DK, DK);
+                    } else {
+                        memcpy(KQ + t*DK, k_data, DK*sizeof(float));
+                    }
+                }
+                for (int64_t dk = 0; dk < DK; dk++) {
+                    float * dst_k = K_f32 + dk * KV_TILE_SZ + tk0;
+                    for (int t = 0; t < nt; t++) {
+                        dst_k[t] = KQ[t*DK + dk];
+                    }
+                }
+            }
+            for (int tk = 0; tk < kv_tile && TB == 0; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
-                if (kv_type == GGML_TYPE_F16) {
-                    const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
-                    }
-                } else {
-                    const float * k_f32_src = (const float *)k_data;
-                    for (int64_t dk = 0; dk < DK; dk++) {
-                        K_f32[dk * KV_TILE_SZ + tk] = k_f32_src[dk];
-                    }
+                for (int64_t dk = 0; dk < DK; dk++) {
+                    K_f32[dk * KV_TILE_SZ + tk] = kv_type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *)k_data)[dk]) : ((const float *)k_data)[dk];
                 }
             }
             memset(KQ, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));

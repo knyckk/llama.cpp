@@ -106,6 +106,45 @@ static inline void simd_gemm_ukernel_tail(
 #endif
 }
 
+// C[RM x N] += A[RM x K] * B[K x N]
+template <int RM>
+static inline void simd_gemm_rows(
+    float       * GGML_RESTRICT C,
+    const float * GGML_RESTRICT A,
+    const float * GGML_RESTRICT B,
+    int K, int N)
+{
+    static constexpr int KN = GGML_F32_EPR;
+
+    int64_t jj = 0;
+    for (; jj + GEMM_RN * KN <= N; jj += GEMM_RN * KN) {
+        simd_gemm_ukernel<RM, GEMM_RN>(C + jj, A, B + jj, K, N);
+    }
+    for (; jj + KN <= N; jj += KN) {
+        simd_gemm_ukernel<RM, 1>(C + jj, A, B + jj, K, N);
+    }
+    if (jj < N) {
+        simd_gemm_ukernel_tail<RM>(C + jj, A, B + jj, K, N, N - jj);
+    }
+}
+
+// tail rows (M_rem < GEMM_RM) in one pass, so each B row is loaded once
+template <int RM>
+static inline void simd_gemm_tail_rows(
+    float       * GGML_RESTRICT C,
+    const float * GGML_RESTRICT A,
+    const float * GGML_RESTRICT B,
+    int M_rem, int K, int N)
+{
+    if constexpr (RM > 0) {
+        if (M_rem == RM) {
+            simd_gemm_rows<RM>(C, A, B, K, N);
+            return;
+        }
+        simd_gemm_tail_rows<RM - 1>(C, A, B, M_rem, K, N);
+    }
+}
+
 // C[M x N] += A[M x K] * B[K x N]
 static void simd_gemm(
     float       * GGML_RESTRICT C,
@@ -113,41 +152,15 @@ static void simd_gemm(
     const float * GGML_RESTRICT B,
     int M, int K, int N)
 {
-    static constexpr int KN = GGML_F32_EPR;
-
     int64_t ii = 0;
     for (; ii + GEMM_RM <= M; ii += GEMM_RM) {
-        int64_t jj = 0;
-        for (; jj + GEMM_RN * KN <= N; jj += GEMM_RN * KN) {
-            simd_gemm_ukernel<GEMM_RM, GEMM_RN>(C + jj, A, B + jj, K, N);
-        }
-        for (; jj + KN <= N; jj += KN) {
-            simd_gemm_ukernel<GEMM_RM, 1>(C + jj, A, B + jj, K, N);
-        }
-        if (jj < N) {
-            simd_gemm_ukernel_tail<GEMM_RM>(C + jj, A, B + jj, K, N, N - jj);
-        }
+        simd_gemm_rows<GEMM_RM>(C, A, B, K, N);
 
         A += GEMM_RM * K;
         C += GEMM_RM * N;
     }
 
-    // Tail rows: one at a time
-    for (; ii < M; ii++) {
-        int64_t jj = 0;
-        for (; jj + GEMM_RN * KN <= N; jj += GEMM_RN * KN) {
-            simd_gemm_ukernel<1, GEMM_RN>(C + jj, A, B + jj, K, N);
-        }
-        for (; jj + KN <= N; jj += KN) {
-            simd_gemm_ukernel<1, 1>(C + jj, A, B + jj, K, N);
-        }
-        if (jj < N) {
-            simd_gemm_ukernel_tail<1>(C + jj, A, B + jj, K, N, N - jj);
-        }
-
-        A += K;
-        C += N;
-    }
+    simd_gemm_tail_rows<GEMM_RM - 1>(C, A, B, (int)(M - ii), K, N);
 }
 #elif defined(GGML_SIMD) && defined(__riscv_v_intrinsic)
 // RM accumulators + 1 B vector = RM + 1 <= 8  =>  RM <= 7

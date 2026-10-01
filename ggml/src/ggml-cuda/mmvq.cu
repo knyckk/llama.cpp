@@ -9,7 +9,13 @@
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
-#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+// GGML_CUDA_MMVQ_PREFETCH: opt-in, use it on all NVIDIA GPUs (for A/B tests on other parts)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK || defined(GGML_CUDA_MMVQ_PREFETCH))
+#define MMVQ_USE_PREFETCH
+#endif
+
+#ifdef MMVQ_USE_PREFETCH
 // returns true only for those quants that benefit from prefetch and false otherwise
 static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
     switch (type) {
@@ -718,7 +724,7 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#ifdef MMVQ_USE_PREFETCH
         // start the next iterations' weight loads early
         if constexpr (mmvq_should_prefetch(type)) {
             constexpr int pf_dist = 2; // loop iterations, not blocks

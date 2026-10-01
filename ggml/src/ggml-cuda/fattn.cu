@@ -538,6 +538,26 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// GGML_CUDA_FA_DECODE=vec|mma forces the kernel for single token decode (for A/B tests)
+static best_fattn_kernel ggml_cuda_fattn_decode_override() {
+    static const best_fattn_kernel value = [] {
+        const char * env = getenv("GGML_CUDA_FA_DECODE");
+        if (env == nullptr) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        const std::string s = env;
+        if (s == "vec") {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (s == "mma") {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        GGML_LOG_WARN("%s: unknown GGML_CUDA_FA_DECODE value '%s', ignoring\n", __func__, env);
+        return BEST_FATTN_KERNEL_NONE;
+    }();
+    return value;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -637,6 +657,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
+            const best_fattn_kernel decode_override = ggml_cuda_fattn_decode_override();
+            if (decode_override != BEST_FATTN_KERNEL_NONE && Q->ne[1] == 1 && Q->ne[3] == 1) {
+                return decode_override;
+            }
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
                 const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&

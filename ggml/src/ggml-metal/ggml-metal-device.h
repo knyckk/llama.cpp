@@ -220,7 +220,6 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_scap,
         bool    has_kvpad,
         bool    has_sparse,
-        bool    has_gqa,
         int32_t nqpsg,
         int32_t ne,
         int32_t nsg,

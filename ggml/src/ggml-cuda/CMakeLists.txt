@@ -149,10 +149,6 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_VMM)
     endif()
 
-    if (GGML_CUDA_MMVQ_PREFETCH)
-        add_compile_definitions(GGML_CUDA_MMVQ_PREFETCH)
-    endif()
-
     if (NOT GGML_CUDA_FA)
         add_compile_definitions(GGML_CUDA_NO_FA)
     endif()

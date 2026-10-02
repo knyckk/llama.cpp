@@ -3585,7 +3585,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         int nqptg = cfg.Q; // queries per threadgroup
 
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
-        int nhptg = 1;                                 // heads per threadgroup
+        const int nhptg = 1;                           // heads per threadgroup
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg == 1 || nqptg == 2 || nqptg == 4);  // only instantiated Q values
@@ -3724,29 +3724,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nqptg = cfg.Q;  // = 1
         }
 
-        // decode with GQA: fill the Q slots with heads that share one K/V head, so each K/V row is read once per group
-        // not used with ALiBi (per-head slope) or sparse (per-row index lists); f32/bf16 K have no Q > 1 kernels
-        {
-            static const bool gqa_disable = getenv("GGML_METAL_FA_VEC_GQA_DISABLE") != nullptr;
-
-            const int64_t gqa_ratio = ne02 % ne12 == 0 ? ne02/ne12 : 1;
-            const int     nq_gqa    = gqa_ratio % 4 == 0 ? 4 : gqa_ratio % 2 == 0 ? 2 : 1;
-
-            const ggml_type k_type = use_kv_f16 ? GGML_TYPE_F16 : op->src[1]->type;
-            const bool k_type_ok = k_type == GGML_TYPE_F16  ||
-                                   k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
-                                   k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
-                                   k_type == GGML_TYPE_Q8_0;
-
-            if (!gqa_disable && !use_sparse && !has_bias && k_type_ok && ne01 == 1 && nq_gqa > 1 &&
-                fa_vec_smem(nsg, nq_gqa) <= props_dev->max_theadgroup_memory_size) {
-                nqptg = nq_gqa;
-                nhptg = nq_gqa;
-            }
-        }
-        const bool use_gqa = nhptg > 1;
-        const int  nq1ptg  = use_gqa ? 1 : nqptg; // query rows per threadgroup
-
         const int32_t ns10 = nb11_attn/nb10_attn;
         const int32_t ns20 = nb21_attn/nb20_attn;
 
@@ -3786,7 +3763,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_kv_max_padded =*/ n_kv_max_padded,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, use_gqa, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -3810,7 +3787,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nq1ptg - 1)/nq1ptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
         } else {
             // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -3823,7 +3800,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nq1ptg - 1)/nq1ptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
 
             // sync the 2 kernels
             ggml_metal_op_concurrency_reset(ctx);

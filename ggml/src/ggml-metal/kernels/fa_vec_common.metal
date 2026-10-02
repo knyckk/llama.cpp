@@ -13,7 +13,6 @@ constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
-constant bool    FC_flash_attn_ext_vec_has_gqa    [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -63,13 +62,6 @@ kernel void kernel_flash_attn_ext_vec(
     const ushort iq2 = tgpig[1];
     const ushort iq1 = tgpig[0];
 
-    // Q slots: Q rows of one head, or (gqa) one row of Q heads that share the same K/V head
-    // slot qq -> row i1_0 + qq*d1, head i2_0 + qq*d2
-    const int i1_0 = FC_flash_attn_ext_vec_has_gqa ? iq1   : iq1*Q;
-    const int i2_0 = FC_flash_attn_ext_vec_has_gqa ? iq2*Q : iq2;
-    const int d1   = FC_flash_attn_ext_vec_has_gqa ? 0 : 1;
-    const int d2   = FC_flash_attn_ext_vec_has_gqa ? 1 : 0;
-
     constexpr short DK4 = DK/4;
     constexpr short DV4 = DV/4;
 
@@ -106,9 +98,9 @@ kernel void kernel_flash_attn_ext_vec(
     so4 += tiisg;
 
     {
-        q += i1_0*args.nb01 + i2_0*args.nb02 + iq3*args.nb03;
+        q += iq1*Q*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
 
-        const short ikv2 = i2_0/(args.ne02/args.ne_12_2);
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
         const short ikv3 = iq3/(args.ne03/args.ne_12_3);
 
         k += ikv2*args.nb12 + ikv3*args.nb13;
@@ -118,8 +110,8 @@ kernel void kernel_flash_attn_ext_vec(
     // load Q query rows to shared memory
     {
         for (short qq = 0; qq < Q; ++qq) {
-            const int iq1_q = i1_0 + qq*d1;
-            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*(d1*args.nb01 + d2*args.nb02));
+            const int iq1_q = iq1*Q + qq;
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + qq*args.nb01);
             if (iq1_q < args.ne01) {
                 for (short i = tiisg; i < PK4; i += NW) {
                     if (i < DK4) {
@@ -163,7 +155,7 @@ kernel void kernel_flash_attn_ext_vec(
         const short ty = tiisg/NL;
 
         // pointer to the mask
-        device const half * pm_base = (device const half *) (mask + i1_0*args.nb31 + (iq3%args.ne33)*args.nb33);
+        device const half * pm_base = (device const half *) (mask + iq1*Q*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
 
         // sparse indices: the list of finite mask entries per query row
         // the sparse path requires Q == 1 (enforced by the host)
@@ -197,8 +189,7 @@ kernel void kernel_flash_attn_ext_vec(
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 // padded query rows clamp to row 0 of the mask to avoid OOB; their scores
                 // are forced to -inf below, so the values never affect the result.
-                pm[qq] = pm_base + ((i1_0 + qq*d1) < args.ne01 ? qq*d1*(args.nb31/sizeof(half)) : -i1_0*(args.nb31/sizeof(half)))
-                                 + ((i2_0 + qq*d2)%args.ne32)*(args.nb32/sizeof(half));
+                pm[qq] = pm_base + ((iq1*Q + qq) < args.ne01 ? qq*(args.nb31/sizeof(half)) : -iq1*Q*(args.nb31/sizeof(half)));
             }
 
             // the last partial chunk uses the pad buffer as source
@@ -207,7 +198,7 @@ kernel void kernel_flash_attn_ext_vec(
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
 
-                const short ikv2 = i2_0/(args.ne02/args.ne_12_2);
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
                 const short ikv3 = iq3/(args.ne03/args.ne_12_3);
 
                 k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
@@ -222,8 +213,8 @@ kernel void kernel_flash_attn_ext_vec(
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         pm[qq] = (device const half *) (mask) +
-                            (i1_0 + qq*d1)*C +
-                            ((i2_0 + qq*d2)%args.ne32)*(C*args.ne31) +
+                            (iq1*Q + qq)*C +
+                            (iq2%args.ne32)*(C*args.ne31) +
                             (iq3%args.ne33)*(C*args.ne31*args.ne32);
                     }
                 }
@@ -245,7 +236,7 @@ kernel void kernel_flash_attn_ext_vec(
                 if (FC_flash_attn_ext_vec_has_sparse) {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         const int i11 = spidx[tiisg];
-                        if ((i1_0 + qq*d1) < args.ne01 && i11 >= 0) {
+                        if ((iq1*Q + qq) < args.ne01 && i11 >= 0) {
                             sm[qq*C + tiisg] = pm[qq][i11];
                         } else {
                             sm[qq*C + tiisg] = -MAXHALF;
@@ -253,7 +244,7 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                        if ((i1_0 + qq*d1) < args.ne01) {
+                        if ((iq1*Q + qq) < args.ne01) {
                             sm[qq*C + tiisg] = pm[qq][ic + tiisg];
                         } else {
                             sm[qq*C + tiisg] = -MAXHALF;
@@ -262,7 +253,7 @@ kernel void kernel_flash_attn_ext_vec(
                 }
             } else {
                 FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-                    if ((i1_0 + qq*d1) >= args.ne01) {
+                    if ((iq1*Q + qq) >= args.ne01) {
                         sm[qq*C + tiisg] = -MAXHALF;
                     }
                 }
@@ -558,7 +549,7 @@ kernel void kernel_flash_attn_ext_vec(
         if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
             FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                 const float m = M[qq];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[i2_0 + qq*d2] : -FLT_MAX/2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
 
                 M[qq] = simd_max(max(M[qq], s));
 
@@ -628,12 +619,12 @@ kernel void kernel_flash_attn_ext_vec(
         device float  * dst1 = (device float  *) dst + nrows*DV*NWG; // the S and M are stored after the results
 
         FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
-            const int iq1_q = i1_0 + qq*d1;
+            const int iq1_q = iq1*Q + qq;
             if (iq1_q >= args.ne01) {
                 continue;
             }
 
-            const int64_t rid = iq3*args.ne2*args.ne1 + (i2_0 + qq*d2) + iq1_q*args.ne1;
+            const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1_q*args.ne1;
 
             const float Sval = NWG == 1 ? (ss[2*qq + 0] == 0.0f ? 0.0f : 1.0f/ss[2*qq + 0]) : 1.0f;
 

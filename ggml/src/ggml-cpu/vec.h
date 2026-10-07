@@ -1600,8 +1600,25 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
+    int i = 0;
     float max = -INFINITY;
-    for (int i = 0; i < n; ++i) {
+#if defined(__AVX2__)
+    if (n >= 16) {
+        // two chains to hide max latency
+        __m256 m0 = _mm256_set1_ps(-INFINITY);
+        __m256 m1 = _mm256_set1_ps(-INFINITY);
+        for (; i + 15 < n; i += 16) {
+            m0 = _mm256_max_ps(m0, _mm256_loadu_ps(x + i));
+            m1 = _mm256_max_ps(m1, _mm256_loadu_ps(x + i + 8));
+        }
+        __m128 m = _mm_max_ps(_mm256_castps256_ps128(m0), _mm256_extractf128_ps(m0, 1));
+        m = _mm_max_ps(m, _mm_max_ps(_mm256_castps256_ps128(m1), _mm256_extractf128_ps(m1, 1)));
+        m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+        m = _mm_max_ss(m, _mm_movehdup_ps(m));
+        max = _mm_cvtss_f32(m);
+    }
+#endif
+    for (; i < n; ++i) {
         max = MAX(max, x[i]);
     }
     *s = max;

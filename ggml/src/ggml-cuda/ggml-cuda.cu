@@ -4964,6 +4964,7 @@ struct ggml_backend_cuda_device_context {
     std::string description;
     std::string pci_bus_id;
     int op_offload_min_batch_size;
+    int op_offload_min_tokens_per_expert;
 };
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
@@ -5651,6 +5652,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // the upload covers all experts used by the batch, but each expert only gets n_tokens*n_expert_used/n_expert tokens of work
+    if (op->op == GGML_OP_MUL_MAT_ID && op->ne[1]*op->ne[2] < (int64_t) dev_ctx->op_offload_min_tokens_per_expert*op->src[0]->ne[2]) {
+        return false;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
@@ -5823,6 +5829,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
         if (!initialized) {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const int min_tokens_per_expert = getenv("GGML_OP_OFFLOAD_MIN_BATCH_MOE") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH_MOE")) : 4;
 
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;
@@ -5846,6 +5853,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                     c = std::tolower(c);
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+                dev_ctx->op_offload_min_tokens_per_expert = min_tokens_per_expert;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,

@@ -11109,6 +11109,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    // CPU FA kernels vs the CPU reference path (-b CPU): GQA decode (nb 1, split KV at kv 1024), GQA small batch (nb 3), tiled prefill with partial tiles (nb 75)
+    // nh=3 marks these cases, select them with -p "nh=3,"
+    for (auto [hsk, hsv] : std::vector<std::pair<int, int>> {{64, 64}, {128, 128}, {256, 256}, {192, 128}}) {
+        for (auto [type_K, type_V] : std::vector<std::pair<ggml_type, ggml_type>> {
+                {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
+                {GGML_TYPE_Q4_0, GGML_TYPE_F16},  {GGML_TYPE_F16,  GGML_TYPE_Q8_0}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1},  113,  1, true, false, 0,    0,     GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1}, 1024,  1, true, false, 0,    0,     GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1},  113,  3, true, false, 0,    0,     GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1},  113, 75, true, false, 0,    0,     GGML_PREC_F32, type_K, type_V));
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1},  256, 75, true, true,  8.0f, 10.0f, GGML_PREC_F32, type_K, type_V));
+            // one unmasked kv per row: tiles with fully masked rows and fully masked tiles
+            test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, 3, {4, 1},  512, 75, true, false, 0,    0,     GGML_PREC_F32, type_K, type_V, {0, 1, 2, 3}, true, false, 1));
+        }
+    }
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

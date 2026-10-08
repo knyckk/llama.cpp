@@ -78,6 +78,7 @@ struct common_cpu_params {
 
 int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
+bool    common_cpu_get_physical_core_mask(bool (&mask)[GGML_MAX_N_THREADS], int & num_physical_cores);
 
 //
 // Common params

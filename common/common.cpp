@@ -198,6 +198,47 @@ static int cpu_count_math_cpus(int n_cpu) {
 /**
  * Returns number of CPUs on system that are useful for math.
  */
+
+bool common_cpu_get_physical_core_mask(bool (&mask)[GGML_MAX_N_THREADS], int & num_physical_cores) {
+    std::memset(mask, 0, sizeof(mask));
+    num_physical_cores = 0;
+#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__)
+    DWORD buffer_size = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &buffer_size)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            return false;
+        }
+    }
+
+    std::vector<char> buffer(buffer_size);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &buffer_size)) {
+        return false;
+    }
+
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data());
+    while (buffer_size > 0) {
+        if (info->Relationship == RelationProcessorCore) {
+            for (WORD g = 0; g < info->Processor.GroupCount; ++g) {
+                KAFFINITY kmask = info->Processor.GroupMask[g].Mask;
+                KAFFINITY primary = kmask & (-((LONG_PTR)kmask));
+                for (int b = 0; b < 64 && b < GGML_MAX_N_THREADS; ++b) {
+                    if (primary & (1ULL << b)) {
+                        mask[b] = true;
+                        num_physical_cores++;
+                        break;
+                    }
+                }
+            }
+        }
+        buffer_size -= info->Size;
+        info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(reinterpret_cast<char*>(info) + info->Size);
+    }
+    return num_physical_cores > 0;
+#else
+    return false;
+#endif
+}
+
 int32_t common_cpu_get_num_math() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -299,6 +340,18 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
     for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
         if (cpuparams.cpumask[i]) {
             n_set++;
+        }
+    }
+
+    if (!cpuparams.mask_valid && n_set == 0) {
+        int num_phys = 0;
+        bool phys_mask[GGML_MAX_N_THREADS];
+        if (common_cpu_get_physical_core_mask(phys_mask, num_phys) && num_phys > 0) {
+            if (cpuparams.n_threads <= num_phys) {
+                std::memcpy(cpuparams.cpumask, phys_mask, sizeof(phys_mask));
+                cpuparams.mask_valid = true;
+                cpuparams.strict_cpu = true;
+            }
         }
     }
 

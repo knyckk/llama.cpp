@@ -2391,13 +2391,22 @@ int llama_bench(int argc, char ** argv) {
         }
 
         struct ggml_threadpool_params tpp = ggml_threadpool_params_default(t.n_threads);
-        if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
-            fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
-            llama_free(ctx);
-            llama_model_free(lmodel);
-            exit(1);
+        if (t.cpu_mask == "0x0" && !t.cpu_strict) {
+            int num_phys = 0;
+            bool phys_mask[GGML_MAX_N_THREADS];
+            if (common_cpu_get_physical_core_mask(phys_mask, num_phys) && num_phys > 0 && t.n_threads <= num_phys) {
+                std::memcpy(tpp.cpumask, phys_mask, sizeof(phys_mask));
+                tpp.strict_cpu = true;
+            }
+        } else {
+            if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
+                fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                exit(1);
+            }
+            tpp.strict_cpu = t.cpu_strict;
         }
-        tpp.strict_cpu = t.cpu_strict;
         tpp.poll       = t.poll;
         tpp.prio       = params.prio;
 

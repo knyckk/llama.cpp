@@ -26,6 +26,7 @@
 #include <array>
 #include <functional>
 #include <float.h>
+#include <thread>
 
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
@@ -165,6 +166,17 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    // Candidate 1: reusable pixel staging buffer
+    std::vector<float> inp_raw_buf;
+
+    // Candidate 2: cached graph builder & graph metadata
+    std::unique_ptr<clip_graph> cached_builder;
+    int cached_nx = 0;
+    int cached_ny = 0;
+    int cached_n_batch = 0;
+    bool cached_is_audio = false;
+    int cached_gen_process = 0;
+
     bool debug_output_embeddings = false;
 
     // for measuring memory usage
@@ -229,6 +241,10 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        cached_builder.reset();
+        if (sched) {
+            ggml_backend_sched_reset(sched.get());
+        }
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -4481,12 +4497,32 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         ctx->rng.seed(params->seed == UINT32_MAX ? std::random_device{}() : params->seed);
     }
 
-    // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+    // build the inference graph or reuse cached graph (Candidate 2)
+    bool can_reuse_graph = ctx->cached_builder != nullptr
+                        && ctx->cached_nx == imgs.entries[0].nx()
+                        && ctx->cached_ny == imgs.entries[0].ny()
+                        && ctx->cached_n_batch == n_batch_cur
+                        && ctx->cached_is_audio == imgs.is_audio
+                        && ctx->cached_gen_process == params->gen_process;
+
+    ggml_cgraph * gf = nullptr;
+    if (can_reuse_graph) {
+        gf = ctx->cached_builder->gf;
+    } else {
+        ctx->cached_builder.reset();
+        ggml_backend_sched_reset(ctx->sched.get());
+        auto builder = clip_get_graph_builder(ctx, imgs, params);
+        gf = builder->build();
+        if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+            return false;
+        }
+        ctx->cached_nx = imgs.entries[0].nx();
+        ctx->cached_ny = imgs.entries[0].ny();
+        ctx->cached_n_batch = n_batch_cur;
+        ctx->cached_is_audio = imgs.is_audio;
+        ctx->cached_gen_process = params->gen_process;
+        ctx->cached_builder = std::move(builder);
     }
 
     // set inputs
@@ -4578,38 +4614,51 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         for (const auto & img : imgs.entries) {
             nelem += img.nx() * img.ny() * 3;
         }
-        std::vector<float> inp_raw(nelem);
+        auto & inp_raw = ctx->inp_raw_buf;
+        inp_raw.resize(nelem);
 
-        // layout of data (note: the channel dim is unrolled to better visualize the layout):
-        //
-        // ┌──W──┐
-        // │     H │  channel = R
-        // ├─────┤ │
-        // │     H │  channel = G
-        // ├─────┤ │
-        // │     H │  channel = B
-        // └─────┘ │
-        //   ──────┘ x B
-
-        // IMPORTANT: [QWEN_VIDEO] the batch dim is currently used for temporal dim in Qwen-VL models
-        // All entries must have the same spatial size (enforced by can_batch_with() during merging)
         {
             const int nx = imgs.entries[0].nx();
             const int ny = imgs.entries[0].ny();
             const int n  = nx * ny;
+            const int n_threads = std::max(1, params->n_threads);
+
+            auto copy_tile_planar = [](const float * src, float * dst, int n, int p_start, int p_end) {
+                float * dst_r = dst;
+                float * dst_g = dst + n;
+                float * dst_b = dst + 2 * n;
+                const float * s = src + 3 * p_start;
+                for (int p = p_start; p < p_end; ++p) {
+                    dst_r[p] = s[0];
+                    dst_g[p] = s[1];
+                    dst_b[p] = s[2];
+                    s += 3;
+                }
+            };
 
             for (int b = 0; b < n_batch_cur; b++) {
                 LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
                 const auto & buf = imgs.entries[b].get_ro_buf();
                 float * batch_entry = inp_raw.data() + b * (3*n);
-                for (int y = 0; y < ny; y++) {
-                    for (int x = 0; x < nx; x++) {
-                        size_t base_src = 3*(y * nx + x);
-                        size_t base_dst =    y * nx + x;
-                        batch_entry[      base_dst] = buf[base_src    ];
-                        batch_entry[1*n + base_dst] = buf[base_src + 1];
-                        batch_entry[2*n + base_dst] = buf[base_src + 2];
+
+                if (n_threads > 1 && n >= 16384) {
+                    const int n_workers = std::min(n_threads, 8);
+                    std::vector<std::thread> workers;
+                    workers.reserve(n_workers);
+                    const int chunk = (n + n_workers - 1) / n_workers;
+                    for (int t = 0; t < n_workers; ++t) {
+                        int p_start = t * chunk;
+                        int p_end = std::min(n, (t + 1) * chunk);
+                        if (p_start >= p_end) break;
+                        workers.emplace_back([=, &buf]() {
+                            copy_tile_planar(buf.data(), batch_entry, n, p_start, p_end);
+                        });
                     }
+                    for (auto & w : workers) {
+                        w.join();
+                    }
+                } else {
+                    copy_tile_planar(buf.data(), batch_entry, n, 0, n);
                 }
             }
         }
@@ -4801,9 +4850,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     std::vector<float> window_mask_data(n_pos * n_pos, std::numeric_limits<float>::lowest());
                     for (int wi = 0; wi < n_pos / 4; wi++) {
                         for (int i = 0; i < 4; i++) {
-                            for (int j = 0; j < 4; j++) {
-                                window_mask_data[(wi*4 + i) * n_pos + (wi*4 + j)] = 0.0f;
-                            }
+                            std::fill_n(&window_mask_data[(wi*4 + i) * n_pos + wi*4], 4, 0.0f);
                         }
                     }
                     set_input_f32("vit_merger_window_mask", window_mask_data);
@@ -5094,9 +5141,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 for (int q = 0; q < n_pos_full; q++) {
                     int lo = std::max(0, q - window);
                     int hi = std::min(n_pos_full - 1, q + window);
-                    for (int k = lo; k <= hi; k++) {
-                        mask[static_cast<size_t>(q) * n_pos_full + k] = 0.0f;
-                    }
+                    std::fill_n(&mask[static_cast<size_t>(q) * n_pos_full + lo], hi - lo + 1, 0.0f);
                 }
 
                 set_input_i32("mimovl_positions_row", positions_row);
@@ -5791,19 +5836,21 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
             GGML_ABORT("Unknown projector type");
     }
 
-    // ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
-    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (reg) {
-        auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-        if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(ctx->backend_cpu, params->n_threads);
+    for (auto * b : ctx->backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (ggml_backend_set_n_threads_fn) {
+                ggml_backend_set_n_threads_fn(b, params->n_threads);
+            }
         }
     }
 
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+        ctx->cached_builder.reset();
         return false;
     }
 

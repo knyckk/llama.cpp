@@ -1503,42 +1503,31 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
+    for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+        const int64_t _i12 = ir1; // logical row index for this expert
 
-    float tmp[16];
+        struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+        const int id       = row_mapping.i1; // selected expert index
 
-    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
-        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
-                const int64_t _i12 = ir1; // logical row index for this expert
+        const int64_t  i11 = id % ne11;
+        const int64_t  i12 = row_mapping.i2; // row index in src1
 
-                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
-                const int id       = row_mapping.i1; // selected expert index
+        const int64_t  i1 = id;  // selected expert index
+        const int64_t  i2 = i12; // row
 
-                const int64_t  i11 = id % ne11;
-                const int64_t  i12 = row_mapping.i2; // row index in src1
+        // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+        //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+        //       the original src1 data pointer, so we should index using the indices directly
+        // TODO: this is a bit of a hack, we should probably have a better way to handle this
+        const char * src1_col = (const char *) wdata +
+            (src1_cont || src1->type != vec_dot_type
+            ? (i11      + i12*ne11)*row_size
+            : (i11*nb11 + i12*nb12));
 
-                const int64_t  i1 = id;  // selected expert index
-                const int64_t  i2 = i12; // row
+        float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
-                const char * src1_col = (const char *) wdata +
-                    (src1_cont || src1->type != vec_dot_type
-                    ? (i11      + i12*ne11)*row_size
-                    : (i11*nb11 + i12*nb12));
-
-                float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
-
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
-                }
-
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
-            }
+        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+            vec_dot(ne00, &dst_col[ir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
         }
     }
 }

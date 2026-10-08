@@ -15,6 +15,7 @@
 struct clip_graph_siglip : clip_graph {
     clip_graph_siglip(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+    bool support_batch() const override { return true; }
 };
 
 struct clip_graph_gemma4v : clip_graph {

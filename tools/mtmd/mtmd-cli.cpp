@@ -362,7 +362,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
                     auto next_chunk = mtmd_input_chunks_get(chunks.ptr.get(), j);
                     auto next_type = mtmd_input_chunk_get_type(next_chunk);
                     if (next_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-                        break; // text chunk splits the batch
+                        continue; // skip intermediate text tokens between media chunks (similar to server-context)
                     }
                     res = mtmd_batch_add_chunk(ctx.mbatch.get(), next_chunk);
                     if (res != 0) {

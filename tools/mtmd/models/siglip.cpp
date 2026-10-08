@@ -16,7 +16,7 @@ ggml_cgraph * clip_graph_siglip::build() {
                             nullptr);
 
     if (proj_type == PROJECTOR_TYPE_GEMMA3) {
-        const int batch_size = 1;
+        const int batch_size = n_batch;
         GGML_ASSERT(n_patches_x == n_patches_y);
         const int patches_per_image = n_patches_x;
         const int kernel_size = hparams.n_merge;

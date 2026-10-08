@@ -168,6 +168,8 @@ struct clip_ctx {
 
     // Candidate 1: reusable pixel staging buffer
     std::vector<float> inp_raw_buf;
+    void * registered_host_buf = nullptr;
+    size_t registered_host_size = 0;
 
     // Candidate 2: cached graph builder & graph metadata
     std::unique_ptr<clip_graph> cached_builder;
@@ -241,6 +243,18 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        if (registered_host_buf) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            if (reg) {
+                auto unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_unregister_host_buffer");
+                if (unreg_fn) {
+                    unreg_fn(registered_host_buf);
+                }
+            }
+            registered_host_buf = nullptr;
+            registered_host_size = 0;
+        }
         cached_builder.reset();
         if (sched) {
             ggml_backend_sched_reset(sched.get());
@@ -924,7 +938,7 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
     // pad width and height to factor
     const int64_t pad_width  = CLIP_ALIGN(width,  scale_factor) - width;
     const int64_t pad_height = CLIP_ALIGN(height, scale_factor) - height;
-    cur = ggml_reshape_3d(ctx0, cur, n_embd, width, height);
+    cur = ggml_reshape_4d(ctx0, cur, n_embd, width, height, n_batch);
     if (pad_width || pad_height) {
         cur     = ggml_pad(ctx0, cur, 0, pad_width, pad_height, 0);
         width  += pad_width;
@@ -932,14 +946,14 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
     }
 
     // unshuffle h
-    cur = ggml_reshape_3d(ctx0, cur, n_embd * scale_factor, width / scale_factor, height);
+    cur = ggml_reshape_4d(ctx0, cur, n_embd * scale_factor, width / scale_factor, height, n_batch);
     cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
 
     // unshuffle w
-    cur = ggml_cont_3d(ctx0, cur, n_embd * scale_factor * scale_factor, height / scale_factor, width / scale_factor);
+    cur = ggml_cont_4d(ctx0, cur, n_embd * scale_factor * scale_factor, height / scale_factor, width / scale_factor, n_batch);
     cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
 
-    cur = ggml_cont_2d(ctx0, cur, cur->ne[0], cur->ne[1] * cur->ne[2]);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0], cur->ne[1] * cur->ne[2] * cur->ne[3]);
     cb(cur, "pixel_shuffle", -1);
 
     return cur;
@@ -4550,11 +4564,15 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         return inp;
     };
 
-    auto set_input_f32 = [&get_inp_tensor](const char * name, const std::vector<float> & values) {
+    auto set_input_f32 = [&get_inp_tensor, ctx](const char * name, const std::vector<float> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
-        ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+        if (ctx->registered_host_buf && values.data() == ctx->registered_host_buf && ctx->backend && ctx->backend != ctx->backend_cpu) {
+            ggml_backend_tensor_set_async(ctx->backend, cur, values.data(), 0, ggml_nbytes(cur));
+        } else {
+            ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+        }
     };
 
     auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
@@ -4617,6 +4635,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         auto & inp_raw = ctx->inp_raw_buf;
         inp_raw.resize(nelem);
 
+        // Host buffer pinning for direct PCIe DMA transfers
+        if (ctx->backend && ctx->backend != ctx->backend_cpu) {
+            void * cur_buf = inp_raw.data();
+            size_t cur_size = inp_raw.size() * sizeof(float);
+            if (cur_buf && (cur_buf != ctx->registered_host_buf || cur_size != ctx->registered_host_size)) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                if (reg) {
+                    auto unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_unregister_host_buffer");
+                    auto reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_host_buffer");
+                    if (ctx->registered_host_buf && unreg_fn) {
+                        unreg_fn(ctx->registered_host_buf);
+                        ctx->registered_host_buf = nullptr;
+                        ctx->registered_host_size = 0;
+                    }
+                    if (reg_fn && reg_fn(cur_buf, cur_size)) {
+                        ctx->registered_host_buf = cur_buf;
+                        ctx->registered_host_size = cur_size;
+                    }
+                }
+            }
+        }
+
         {
             const int nx = imgs.entries[0].nx();
             const int ny = imgs.entries[0].ny();
@@ -4636,29 +4677,47 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
             };
 
-            for (int b = 0; b < n_batch_cur; b++) {
-                LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
-                const auto & buf = imgs.entries[b].get_ro_buf();
-                float * batch_entry = inp_raw.data() + b * (3*n);
+            if (n_batch_cur > 1 && n_threads > 1) {
+                const int n_workers = std::min(n_threads, n_batch_cur);
+                std::vector<std::thread> workers;
+                workers.reserve(n_workers);
+                for (int t = 0; t < n_workers; ++t) {
+                    workers.emplace_back([=, &imgs, &inp_raw]() {
+                        for (int b = t; b < n_batch_cur; b += n_workers) {
+                            const auto & buf = imgs.entries[b].get_ro_buf();
+                            float * batch_entry = inp_raw.data() + b * (3 * n);
+                            copy_tile_planar(buf.data(), batch_entry, n, 0, n);
+                        }
+                    });
+                }
+                for (auto & w : workers) {
+                    w.join();
+                }
+            } else {
+                for (int b = 0; b < n_batch_cur; b++) {
+                    LOG_DBG("%s: copying image %d/%d to input buffer (nx=%d, ny=%d)\n", __func__, b+1, n_batch_cur, nx, ny);
+                    const auto & buf = imgs.entries[b].get_ro_buf();
+                    float * batch_entry = inp_raw.data() + b * (3*n);
 
-                if (n_threads > 1 && n >= 16384) {
-                    const int n_workers = std::min(n_threads, 8);
-                    std::vector<std::thread> workers;
-                    workers.reserve(n_workers);
-                    const int chunk = (n + n_workers - 1) / n_workers;
-                    for (int t = 0; t < n_workers; ++t) {
-                        int p_start = t * chunk;
-                        int p_end = std::min(n, (t + 1) * chunk);
-                        if (p_start >= p_end) break;
-                        workers.emplace_back([=, &buf]() {
-                            copy_tile_planar(buf.data(), batch_entry, n, p_start, p_end);
-                        });
+                    if (n_threads > 1 && n >= 16384) {
+                        const int n_workers = std::min(n_threads, 8);
+                        std::vector<std::thread> workers;
+                        workers.reserve(n_workers);
+                        const int chunk = (n + n_workers - 1) / n_workers;
+                        for (int t = 0; t < n_workers; ++t) {
+                            int p_start = t * chunk;
+                            int p_end = std::min(n, (t + 1) * chunk);
+                            if (p_start >= p_end) break;
+                            workers.emplace_back([=, &buf]() {
+                                copy_tile_planar(buf.data(), batch_entry, n, p_start, p_end);
+                            });
+                        }
+                        for (auto & w : workers) {
+                            w.join();
+                        }
+                    } else {
+                        copy_tile_planar(buf.data(), batch_entry, n, 0, n);
                     }
-                    for (auto & w : workers) {
-                        w.join();
-                    }
-                } else {
-                    copy_tile_planar(buf.data(), batch_entry, n, 0, n);
                 }
             }
         }
@@ -5859,8 +5918,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     if (embeddings != nullptr) {
         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
-        const int n_tokens_out = embeddings->ne[1];
-        const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
+        const int n_tokens_out = embeddings->ne[1] * (embeddings->ne[2] > 0 ? embeddings->ne[2] : 1);
+        const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]) * n_batch_cur;
         if (n_tokens_out != expected_n_tokens_out) {
             LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
             GGML_ABORT("Invalid number of output tokens");

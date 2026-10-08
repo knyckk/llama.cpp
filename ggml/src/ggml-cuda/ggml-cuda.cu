@@ -5042,7 +5042,8 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    const char * env = getenv("GGML_CUDA_REGISTER_HOST");
+    if (env && strcmp(env, "0") == 0) {
         return false;
     }
 
@@ -5065,7 +5066,8 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    const char * env = getenv("GGML_CUDA_REGISTER_HOST");
+    if (env && strcmp(env, "0") == 0) {
         return;
     }
 

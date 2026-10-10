@@ -711,6 +711,9 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
         case GGML_UNARY_OP_SOFTPLUS:
             ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
             break;
+        case GGML_UNARY_OP_GELU:
+            ggml_cuda_op_unary_mul_impl<op_gelu>(ctx, unary_node, mul_node);
+            break;
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
     }

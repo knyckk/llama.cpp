@@ -285,7 +285,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "pe_in", il);
 
             cur = build_lora_mm(model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_tokens]
-            cur = ggml_gelu(ctx0, cur);
 
             ggml_tensor * inp_this_layer = gemma4_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
@@ -293,7 +292,8 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
-            cur = ggml_mul(ctx0, cur, inp_this_layer);
+            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_mul(ctx0, inp_this_layer, cur);
             cur = build_lora_mm(model.layers[il].per_layer_proj, cur); // [n_embd, n_tokens]
             cur = build_norm(cur, model.layers[il].per_layer_post_norm, nullptr, LLM_NORM_RMS, il);
             cb(cur, "per_layer_embd_out", il);

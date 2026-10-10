@@ -150,7 +150,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    const bool early_strip = (inp_out_ids != nullptr);
+    const bool early_strip = (inp_out_ids != nullptr) && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);

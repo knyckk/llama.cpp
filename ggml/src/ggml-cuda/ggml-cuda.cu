@@ -2693,6 +2693,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        memset(prop.node.src, 0, sizeof(prop.node.src));
+        prop.node.view_src = nullptr;
+        prop.node.extra    = nullptr;
+        memset(prop.node.padding, 0, sizeof(prop.node.padding));
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {

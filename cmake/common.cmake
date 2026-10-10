@@ -55,4 +55,8 @@ function(llama_add_compile_flags)
             link_libraries     (-fsanitize=undefined)
         endif()
     endif()
+
+    if (MSVC)
+        add_compile_options(/Ox /Ob3 /Ot /Oi /Gy)
+    endif()
 endfunction()

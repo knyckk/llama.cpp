@@ -3290,9 +3290,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     if ((is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
-        const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
-        const ggml_tensor * ffn_up   = cgraph->nodes[node_idx + 1];
         const ggml_tensor * glu      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * n0       = cgraph->nodes[node_idx];
+        const ggml_tensor * n1       = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * ffn_gate = (glu->src[0] == n0) ? n0 : n1;
+        const ggml_tensor * ffn_up   = (glu->src[0] == n0) ? n1 : n0;
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };

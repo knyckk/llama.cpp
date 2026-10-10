@@ -150,7 +150,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
-    const bool early_strip = (inp_out_ids != nullptr) && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    const bool early_strip = (inp_out_ids != nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
@@ -320,13 +320,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
-
-    if (!early_strip && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
-
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
@@ -417,4 +410,3 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
     return inp_per_layer;
 }
-

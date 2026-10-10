@@ -1618,15 +1618,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    // extract nextn embeddings (hidden state before the final output norm)
-    if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-        GGML_ASSERT(backend_h != nullptr);
-
-        const uint32_t n_embd = hparams.n_embd_out();
-        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
-    }
+    // [single-target] draft nextn extraction removed
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -2012,25 +2004,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
-        // extract nextn embeddings before
-        // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
-        {
-            const bool masked    = cparams.embeddings_nextn_masked;
-            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
-            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
-
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-                GGML_ASSERT(backend_h != nullptr);
-
-                const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
-
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
-                extract_all_idxs = extract_all_idxs || !masked;
-            }
-        }
+        // [single-target] draft nextn extraction removed
 
         if (extract_all_idxs) {
             GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
@@ -2126,7 +2100,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
-    bool has_embd_nextn = cparams.embeddings_nextn;
+    bool has_embd_nextn = false; // single-target: draft disabled
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {

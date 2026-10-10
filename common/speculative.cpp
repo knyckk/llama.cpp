@@ -2518,6 +2518,10 @@ common_speculative_init_result::common_speculative_init_result(
       llama_model * model_tgt,
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(model_tgt);
+    GGML_UNUSED(ctx_tgt);
+    return;
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
@@ -2603,6 +2607,9 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    GGML_UNUSED(params);
+    GGML_UNUSED(n_seq);
+    return nullptr;
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {

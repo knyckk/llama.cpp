@@ -162,7 +162,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     inpL = build_inp_embd(model.tok_embd);
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+    inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd));
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -450,10 +450,6 @@ public:
                 llama_prefetch_rows(ple, ubatch->token, ubatch->n_tokens);
             }
             ggml_backend_tensor_set(tokens, ubatch->token, 0, ubatch->n_tokens * ggml_element_size(tokens));
-        } else if (prefetch) {
-            // [TAG_GEMMA4_IMG_PADDING]
-            const int32_t padding = 0;
-            llama_prefetch_rows(ple, &padding, 1);
         }
     }
 
@@ -473,7 +469,7 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
 
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_per_layer);
-    if (ubatch.token) {
+    GGML_ASSERT(ubatch.token != nullptr);
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         ggml_set_input(inp->tokens);
         res->t_inp_tokens = inp->tokens;
@@ -482,21 +478,6 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
         inp_per_layer = ggml_scale     (ctx0, inp_per_layer, tok_embd_scale);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
-    } else {
-        // [TAG_GEMMA4_IMG_PADDING]
-        // Multimodal embedding path: use padding token (ID=0) embedding
-        // TODO: verify if this is the correct behavior in transformers implementation
-        const int64_t embd_size = model.per_layer_tok_embd->ne[0];  // n_embd_per_layer * n_layer
-
-        // Extract and dequantize padding token embedding (row 0)
-        ggml_tensor * padding = ggml_view_1d(ctx0, model.per_layer_tok_embd, embd_size, 0);
-        inp_per_layer = ggml_cast (ctx0, padding, GGML_TYPE_F32);
-        inp_per_layer = ggml_scale(ctx0, inp_per_layer, tok_embd_scale);
-
-        // Reshape to [n_embd_per_layer, n_layer, 1]
-        inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, 1);
-        cb(inp_per_layer, "inp_per_layer_multimodal", -1);
-    }
     res->add_input(std::move(inp));
     return inp_per_layer;
 }
